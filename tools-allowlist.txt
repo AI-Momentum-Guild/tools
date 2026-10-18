@@ -1,0 +1,9 @@
+# Products allowed into the public 'tools' marketplace (AI-Momentum-Guild/tools), one product id per line.
+# publish needs a product to be BOTH in the 'free' bundle and on this list (MSD #53757 D25(1)), so a single
+# wrong bundle tag cannot publish a paid tool to the public. Adding a line is Simon's decision; say who agreed
+# and when in the commit message. If this file is missing, nothing can be published to 'tools'.
+#
+# D14 (16 Oct 2026, Simon): the public marketplace starts with the two starters. They are published under
+# MSD #53763, once 'free' is in their bundles.
+ai-team-starter
+ai-project-starter

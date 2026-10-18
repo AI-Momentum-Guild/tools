@@ -1,0 +1,9 @@
+{
+  "static_files": [
+    ".github/check_plugins.py",
+    ".github/workflows/check-plugins.yml",
+    "README.md",
+    "setup.ps1",
+    "tools-allowlist.txt"
+  ]
+}

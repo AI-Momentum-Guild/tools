@@ -1,0 +1,19 @@
+# Second lock on the public marketplace (MSD #53757 D25(1)): every plugin must be on tools-allowlist.txt.
+# No third-party actions: the repository is fetched with plain git, so nothing outside GitHub's runner runs.
+name: Check plugins are allowed
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  allowlist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch this commit
+        run: |
+          git init --quiet .
+          git fetch --quiet --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git checkout --quiet FETCH_HEAD
+      - name: Check every plugin is on the allowlist
+        run: python3 .github/check_plugins.py .

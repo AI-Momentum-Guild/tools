@@ -1,0 +1,10 @@
+{
+  "name": "ai-momentum",
+  "owner": {
+    "name": "AI Momentum Guild"
+  },
+  "metadata": {
+    "description": "AI Momentum Tools: free tools from the AI Momentum Guild"
+  },
+  "plugins": []
+}
