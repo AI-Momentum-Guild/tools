@@ -9,12 +9,16 @@
 
     In order, it:
       1. Checks Git, Node.js and the GitHub CLI. IT normally installs these machine-wide
-         (install-prerequisites.ps1); any that are missing are installed for this user with winget.
-      2. Installs Claude Code with Anthropic's own installer (https://claude.ai/install.ps1),
+         (install-prerequisites.ps1); any that are missing are installed for this user with winget or,
+         on a laptop without winget, from the publisher's own download with its signature checked.
+      2. Installs the tools the Day 2 skills use, if missing: gitleaks (the second secret scanner) the same way,
+         and the Neon and Vercel command-line tools with npm. A failure here is reported with the command
+         to run later, and setup carries on: only the security check and moving an app to hosting need them.
+      3. Installs Claude Code with Anthropic's own installer (https://claude.ai/install.ps1),
          for this user only. Skipped if Claude Code is already installed.
-      3. Signs the GitHub CLI in to GitHub (a browser sign-in) and, unless Git already has a
+      4. Signs the GitHub CLI in to GitHub (a browser sign-in) and, unless Git already has a
          credential helper for github.com, lets Git use it, so Claude Code can read private repositories.
-      4. Adds each AI Momentum plugin marketplace this GitHub account can reach, plus the team
+      5. Adds each AI Momentum plugin marketplace this GitHub account can reach, plus the team
          toolshed if one is given, installs their plugins, and turns automatic updates on for them.
 
     It is safe to run again: every step that is already done is skipped.
@@ -49,14 +53,24 @@ $script:CallerErrorAction = $ErrorActionPreference
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$script:SetupVersion = '0.1.0'
+$script:SetupVersion = '0.2.0'
 $script:SignedIn = $false
 $script:ClaudeInstaller = 'https://claude.ai/install.ps1'
 
 $script:Tools = @(
-    [pscustomobject]@{ Command = 'git';  Name = 'Git';        WingetId = 'Git.Git' }
-    [pscustomobject]@{ Command = 'node'; Name = 'Node.js';    WingetId = 'OpenJS.NodeJS.LTS' }
-    [pscustomobject]@{ Command = 'gh';   Name = 'GitHub CLI'; WingetId = 'GitHub.cli' }
+    [pscustomobject]@{ Command = 'git';  Name = 'Git';        WingetId = 'Git.Git';            Signer = 'Johannes Schindelin' }
+    [pscustomobject]@{ Command = 'node'; Name = 'Node.js';    WingetId = 'OpenJS.NodeJS.LTS'; Signer = 'OpenJS Foundation' }
+    [pscustomobject]@{ Command = 'gh';   Name = 'GitHub CLI'; WingetId = 'GitHub.cli';        Signer = 'GitHub, Inc.' }
+)
+
+# Used by the Day 2 skills, so setup goes on without them. gitleaks is not code-signed: its download is checked
+# against the SHA-256 the release publishes instead.
+$script:OptionalTools = @(
+    [pscustomobject]@{ Command = 'gitleaks'; Name = 'gitleaks'; WingetId = 'Gitleaks.Gitleaks'; Signer = $null }
+)
+$script:NpmTools = @(
+    [pscustomobject]@{ Command = 'neonctl'; Name = 'Neon CLI';   Package = 'neonctl' }
+    [pscustomobject]@{ Command = 'vercel';  Name = 'Vercel CLI'; Package = 'vercel' }
 )
 
 # The AI Momentum marketplaces (MSD #53757 D14). Each is added only if this GitHub account can reach it.
@@ -113,10 +127,128 @@ function Import-SessionPath {
     $env:PATH = (@($machine, $user, $claudeBin, $env:PATH) | Where-Object { $_ }) -join ';'
 }
 
+function Get-PackageArchitecture {
+    $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    switch ("$arch".ToUpperInvariant()) {
+        'ARM64' { return 'arm64' }
+        'AMD64' { return 'x64' }
+        default { throw "Unsupported processor architecture '$arch'. This script supports x64 and ARM64." }
+    }
+}
+
+function Get-DirectDownload {
+    <#
+        Where to get one tool straight from its publisher, for a laptop without winget.
+        Git is the publisher's installer (which installs for the current user when not run as administrator);
+        Node.js and the GitHub CLI are the publishers' zip files, unpacked into the user's own profile.
+        Returns Uri, FileName, Kind ('installer' or 'zip'), for a zip the Program inside it, and Sha256 when the
+        program is not signed and the download is checked against the publisher's checksum instead.
+    #>
+    param([Parameter(Mandatory)] $Tool, [string]$Architecture = (Get-PackageArchitecture))
+    $headers = @{ 'User-Agent' = 'ai-dev-foundations-setup' }
+    switch ($Tool.WingetId) {
+        'Git.Git' {
+            $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest' -Headers $headers -UseBasicParsing
+            $suffix = if ($Architecture -eq 'arm64') { '-arm64.exe' } else { '-64-bit.exe' }
+            $asset = $release.assets | Where-Object { $_.name -like "Git-*$suffix" -and $_.name -notlike '*busybox*' } | Select-Object -First 1
+            if (-not $asset) { throw 'No Git for Windows installer found in the latest release.' }
+            return [pscustomobject]@{ Uri = $asset.browser_download_url; FileName = $asset.name; Kind = 'installer'; Program = $null; Sha256 = $null }
+        }
+        'OpenJS.NodeJS.LTS' {
+            $index = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -Headers $headers -UseBasicParsing
+            $lts = $index | Where-Object { $_.lts } | Select-Object -First 1
+            if (-not $lts) { throw 'No Node.js LTS release found in the nodejs.org index.' }
+            $file = "node-$($lts.version)-win-$Architecture.zip"
+            return [pscustomobject]@{ Uri = "https://nodejs.org/dist/$($lts.version)/$file"; FileName = $file; Kind = 'zip'; Program = 'node.exe'; Sha256 = $null }
+        }
+        'GitHub.cli' {
+            $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/cli/cli/releases/latest' -Headers $headers -UseBasicParsing
+            $suffix = if ($Architecture -eq 'arm64') { '_windows_arm64.zip' } else { '_windows_amd64.zip' }
+            $asset = $release.assets | Where-Object { $_.name -like "gh_*$suffix" } | Select-Object -First 1
+            if (-not $asset) { throw 'No GitHub CLI download found in the latest release.' }
+            return [pscustomobject]@{ Uri = $asset.browser_download_url; FileName = $asset.name; Kind = 'zip'; Program = 'bin\gh.exe'; Sha256 = $null }
+        }
+        'Gitleaks.Gitleaks' {
+            $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/gitleaks/gitleaks/releases/latest' -Headers $headers -UseBasicParsing
+            $suffix = if ($Architecture -eq 'arm64') { '_windows_arm64.zip' } else { '_windows_x64.zip' }
+            $asset = $release.assets | Where-Object { $_.name -like "gitleaks_*$suffix" } | Select-Object -First 1
+            $sums = $release.assets | Where-Object { $_.name -like 'gitleaks_*_checksums.txt' } | Select-Object -First 1
+            if (-not $asset -or -not $sums) { throw 'No gitleaks download and checksum list found in the latest release.' }
+            $list = Invoke-RestMethod -Uri $sums.browser_download_url -Headers $headers -UseBasicParsing
+            $line = "$list" -split "`n" | Where-Object { $_ -match "^([0-9a-fA-F]{64})\s+\*?$([regex]::Escape($asset.name))\s*$" } | Select-Object -First 1
+            if (-not $line) { throw "The gitleaks checksum list has no entry for $($asset.name)." }
+            $hash = ($line -split '\s+')[0]
+            return [pscustomobject]@{ Uri = $asset.browser_download_url; FileName = $asset.name; Kind = 'zip'; Program = 'gitleaks.exe'; Sha256 = $hash }
+        }
+        default { throw "No direct download is defined for '$($Tool.Name)'." }
+    }
+}
+
+function Test-FileSignature {
+    param([Parameter(Mandatory)] [string]$Path, [Parameter(Mandatory)] [string]$Signer)
+    $signature = Get-AuthenticodeSignature -FilePath $Path
+    if ($signature.Status -ne 'Valid') { return $false }
+    # A CN containing a comma is quoted in the subject (CN="GitHub, Inc."), so drop the quotes first.
+    $subject = $signature.SignerCertificate.Subject -replace '"', ''
+    return ($subject -like "*CN=$Signer,*" -or $subject -like "*CN=$Signer")
+}
+
+function Add-UserPath {
+    param([Parameter(Mandatory)] [string]$Directory)
+    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if (($user -split ';') -notcontains $Directory) {
+        [Environment]::SetEnvironmentVariable('Path', ((@($user, $Directory) | Where-Object { $_ }) -join ';'), 'User')
+    }
+}
+
+function Install-ToolDirect {
+    <# Downloads one tool from its publisher, checks the signature and installs it for this user. Returns $true or a failure message. #>
+    param([Parameter(Mandatory)] $Tool)
+    $work = Join-Path ([IO.Path]::GetTempPath()) ('aidf-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $work | Out-Null
+    try {
+        $download = Get-DirectDownload -Tool $Tool
+        $file = Join-Path $work $download.FileName
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $download.Uri -OutFile $file -UseBasicParsing
+        if ($download.Sha256 -and (Get-FileHash -Path $file -Algorithm SHA256).Hash -ne $download.Sha256.ToUpperInvariant()) {
+            return "the download does not match the SHA-256 its publisher lists"
+        }
+
+        if ($download.Kind -eq 'installer') {
+            if (-not (Test-FileSignature -Path $file -Signer $Tool.Signer)) { return "the download is not validly signed by $($Tool.Signer)" }
+            $proc = Start-Process -FilePath $file -ArgumentList @('/VERYSILENT', '/NORESTART', '/SP-', '/SUPPRESSMSGBOXES') -Wait -PassThru
+            if ($proc.ExitCode -ne 0) { return "the installer exited with code $($proc.ExitCode)" }
+            return $true
+        }
+
+        $unpacked = Join-Path $work 'unpacked'
+        Expand-Archive -Path $file -DestinationPath $unpacked -Force
+        $root = Get-ChildItem -Path $unpacked -Directory | Select-Object -First 1
+        $source = if ($root -and -not (Test-Path (Join-Path $unpacked $download.Program))) { $root.FullName } else { $unpacked }
+        $program = Join-Path $source $download.Program
+        if (-not (Test-Path $program)) { return "$($download.Program) is not in the download" }
+        if ($Tool.Signer -and -not (Test-FileSignature -Path $program -Signer $Tool.Signer)) { return "$($download.Program) is not validly signed by $($Tool.Signer)" }
+
+        $target = Join-Path $env:LOCALAPPDATA ('Programs\' + $Tool.Command)
+        if (Test-Path $target) { Remove-Item -Recurse -Force -Path $target }
+        New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
+        Move-Item -Path $source -Destination $target
+        Add-UserPath -Directory (Split-Path (Join-Path $target $download.Program))
+        return $true
+    }
+    catch {
+        return $_.Exception.Message
+    }
+    finally {
+        Remove-Item -Recurse -Force -Path $work -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-MissingTool {
     [CmdletBinding(SupportsShouldProcess = $true)]
     [OutputType([bool])]
-    param([Parameter(Mandatory)] $Tool)
+    param([Parameter(Mandatory)] $Tool, [switch]$Optional)
     if (Test-Tool $Tool.Command) {
         Write-Step $Tool.Name 'present'
         return $true
@@ -133,8 +265,60 @@ function Install-MissingTool {
         return $true
     }
     $why = if ($run.ExitCode -eq 127) { 'winget is not available' } else { 'winget could not install it for this user' }
-    Write-Step $Tool.Name "FAILED: $why. Ask IT to run install-prerequisites.ps1, then run this again"
+    Write-Step $Tool.Name "$why; downloading it from the publisher instead"
+    $direct = Install-ToolDirect -Tool $Tool
+    Import-SessionPath
+    if ($direct -eq $true -and (Test-Tool $Tool.Command)) {
+        Write-Step $Tool.Name 'installed'
+        return $true
+    }
+    $reason = if ($direct -eq $true) { 'it installed but is not on PATH yet' } else { $direct }
+    if ($Optional) {
+        Write-Step $Tool.Name "NOT INSTALLED: $reason. Setup carries on; to add it later run: winget install $($Tool.WingetId)"
+        return $false
+    }
+    Write-Step $Tool.Name "FAILED: $reason. Ask IT to run install-prerequisites.ps1, then run this again"
     return $false
+}
+
+function Install-NpmTool {
+    <# Installs one command-line tool with npm for this user. A failure is reported with the command to run later. #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)] $Tool)
+    if (Test-Tool $Tool.Command) {
+        Write-Step $Tool.Name 'present'
+        return $true
+    }
+    if (-not $PSCmdlet.ShouldProcess($Tool.Name, 'Install for this user with npm')) {
+        Write-Step $Tool.Name 'missing; would be installed with npm'
+        return $true
+    }
+    $run = Invoke-Native npm @('install', '--global', '--no-fund', '--no-audit', $Tool.Package)
+    if ($run.ExitCode -eq 0 -and -not (Test-Tool $Tool.Command)) {
+        # When IT installed Node.js for all users, npm's per-user folder may not be on this person's PATH yet.
+        $prefix = Invoke-Native npm @('prefix', '--global')
+        if ($prefix.ExitCode -eq 0 -and $prefix.Stdout) { Add-UserPath -Directory $prefix.Stdout }
+    }
+    Import-SessionPath
+    if (Test-Tool $Tool.Command) {
+        Write-Step $Tool.Name 'installed'
+        return $true
+    }
+    $why = if ($run.ExitCode -ne 0) { ("$($run.Output)" -split "`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 1) } else { 'it installed but is not on PATH yet' }
+    Write-Step $Tool.Name "NOT INSTALLED: $why. Setup carries on; to add it later run: npm install --global $($Tool.Package)"
+    return $false
+}
+
+function Save-ClaudeCodePath {
+    # Anthropic's installer puts claude in ~\.local\bin but does not add it to the stored PATH, so a
+    # new PowerShell window could not find it. Import-SessionPath only covers this window.
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+    $claudeBin = Join-Path $HOME '.local\bin'
+    if (-not (Test-Path (Join-Path $claudeBin 'claude.exe'))) { return }
+    if ((([Environment]::GetEnvironmentVariable('Path', 'User')) -split ';') -contains $claudeBin) { return }
+    if ($PSCmdlet.ShouldProcess('PATH', "Add $claudeBin for this user")) { Add-UserPath -Directory $claudeBin }
 }
 
 function Install-ClaudeCode {
@@ -142,6 +326,7 @@ function Install-ClaudeCode {
     [OutputType([bool])]
     param()
     if (Test-Tool 'claude') {
+        Save-ClaudeCodePath
         Write-Step 'Claude Code' 'present'
         return $true
     }
@@ -152,6 +337,7 @@ function Install-ClaudeCode {
     & ([scriptblock]::Create((Invoke-RestMethod -Uri $script:ClaudeInstaller -UseBasicParsing))) | Out-Host
     Import-SessionPath
     if (Test-Tool 'claude') {
+        Save-ClaudeCodePath
         Write-Step 'Claude Code' 'installed'
         return $true
     }
@@ -248,6 +434,13 @@ function Add-Marketplace {
         Write-Step $label "would add marketplace $($Market.Repo)"
     }
     else {
+        # Claude Code clones with Git prompts switched off, so a credential helper that has not yet
+        # signed in (such as Git Credential Manager left in place under D25(4)) fails the clone.
+        # Reaching the repository once here, with the person present, lets that helper sign in first.
+        if ((Invoke-Interactive git @('ls-remote', "https://github.com/$($Market.Repo).git", 'HEAD')) -ne 0) {
+            Write-Step $label "FAILED: Git could not sign in to $($Market.Repo). Sign in with the same GitHub account when asked, then run this again"
+            return 'failed'
+        }
         $add = Invoke-Native claude @('plugin', 'marketplace', 'add', $Market.Repo)
         if ($add.ExitCode -ne 0) {
             Write-Step $label "FAILED: claude plugin marketplace add: $($add.Output)"
@@ -342,6 +535,8 @@ function Invoke-Setup {
     foreach ($tool in $script:Tools) {
         if (-not (Install-MissingTool -Tool $tool)) { return 1 }
     }
+    foreach ($tool in $script:OptionalTools) { $null = Install-MissingTool -Tool $tool -Optional }
+    foreach ($tool in $script:NpmTools) { $null = Install-NpmTool -Tool $tool }
     if (-not (Install-ClaudeCode)) { return 1 }
     if (-not (Test-Tool 'gh') -or -not (Test-Tool 'claude')) {
         if (-not $WhatIfPreference) {
